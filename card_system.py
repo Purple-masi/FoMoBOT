@@ -84,7 +84,6 @@ async def add_card_to_db(interaction: Interaction, name: str, description: str, 
     except sqlite3.IntegrityError:
         await interaction.response.send_message(f"Карточка с именем '{name}' уже существует.", ephemeral=True)
 
-
 async def give_card_to_player(interaction: Interaction, user: discord.Member, cardname: str, cardcur, cardcon):
     # Поиск карточки в базе данных
     cardcur.execute("SELECT id FROM cards WHERE name = ?", (cardname,))
@@ -96,10 +95,22 @@ async def give_card_to_player(interaction: Interaction, user: discord.Member, ca
 
     card_id = card[0]
 
+    # Проверка, есть ли у пользователя эта карточка
+    cardcur.execute("SELECT 1 FROM player_cards WHERE player_id = ? AND card_id = ?", (user.id, card_id))
+    if cardcur.fetchone():
+        await interaction.response.send_message(
+            f"У пользователя {user.mention} уже есть карточка '{cardname}'.", ephemeral=True
+        )
+        return
+
     # Добавление карточки игроку
-    cardcur.execute("INSERT INTO player_cards (player_id, card_id) VALUES (?, ?)", (user.id, card_id))
-    cardcon.commit()
-    await interaction.response.send_message(f"Карточка '{cardname}' успешно выдана игроку {user.mention}!", ephemeral=True)
+    try:
+        cardcur.execute("INSERT INTO player_cards (player_id, card_id) VALUES (?, ?)", (user.id, card_id))
+        cardcon.commit()
+        await interaction.response.send_message(f"Карточка '{cardname}' успешно выдана игроку {user.mention}!", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Ошибка при выдаче карточки: {str(e)}", ephemeral=True)
+
 
 
 async def delete_card_from_db(interaction: Interaction, name: str, cardcur, cardcon):

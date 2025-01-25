@@ -20,28 +20,66 @@ CREATE TABLE IF NOT EXISTS marketplace (
 """)
 market_db.commit()
 
-async def list_market(interaction: Interaction, card_cur: sqlite3.Cursor):
-    """Отобразить список всех карт на торговой площадке."""
-    market_cur.execute("SELECT id, seller_id, card_id, price FROM marketplace")
-    listings = market_cur.fetchall()
+from discord.ui import View, Button
+from discord import ButtonStyle, Interaction, Embed
 
-    if not listings:
-        await interaction.response.send_message("На торговой площадке сейчас нет предложений.", ephemeral=True)
-        return
+class MarketView(View):
+    def __init__(self, market_cur, card_cur):
+        super().__init__(timeout=None)
+        self.market_cur = market_cur
+        self.card_cur = card_cur
 
-    embed = Embed(title="Торговая площадка", description="Доступные карточки для покупки", color=0x00ff00)
-    for listing_id, seller_id, card_id, price in listings:
-        card_cur.execute("SELECT name, rarity FROM cards WHERE id = ?", (card_id,))
-        card_data = card_cur.fetchone()
-        if card_data:
-            card_name, card_rarity = card_data
-            embed.add_field(
-                name=f"ID: {listing_id} - {card_name} ({card_rarity})",
-                value=f"Продавец: <@{seller_id}>\nЦена: {price} монет",
-                inline=False
-            )
+        # Создаем кнопку "Обновить"
+        self.refresh_button = Button(label="🔄", style=ButtonStyle.primary)
+        self.refresh_button.callback = self.refresh_market
+        self.add_item(self.refresh_button)
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    async def send_market(self, interaction: Interaction):
+        """Отправить начальное сообщение с торговой площадкой."""
+        self.market_cur.execute("SELECT id, seller_id, card_id, price FROM marketplace")
+        listings = self.market_cur.fetchall()
+
+        embed = Embed(title="Торговая площадка", description="Доступные карточки для покупки", color=0x00ff00)
+
+        if not listings:
+            embed.description = "На торговой площадке сейчас нет предложений."
+        else:
+            for listing_id, seller_id, card_id, price in listings:
+                self.card_cur.execute("SELECT name, rarity FROM cards WHERE id = ?", (card_id,))
+                card_data = self.card_cur.fetchone()
+                if card_data:
+                    card_name, card_rarity = card_data
+                    embed.add_field(
+                        name=f"ID: {listing_id} - {card_name} ({card_rarity})",
+                        value=f"Продавец: <@{seller_id}>\nЦена: {price} монет",
+                        inline=False
+                    )
+
+        await interaction.response.send_message(embed=embed, view=self, ephemeral=True)
+
+    async def refresh_market(self, interaction: Interaction):
+        """Обработчик кнопки обновления."""
+        self.market_cur.execute("SELECT id, seller_id, card_id, price FROM marketplace")
+        listings = self.market_cur.fetchall()
+
+        embed = Embed(title="Торговая площадка", description="Доступные карточки для покупки", color=0x00ff00)
+
+        if not listings:
+            embed.description = "На торговой площадке сейчас нет предложений."
+        else:
+            for listing_id, seller_id, card_id, price in listings:
+                self.card_cur.execute("SELECT name, rarity FROM cards WHERE id = ?", (card_id,))
+                card_data = self.card_cur.fetchone()
+                if card_data:
+                    card_name, card_rarity = card_data
+                    embed.add_field(
+                        name=f"ID: {listing_id} - {card_name} ({card_rarity})",
+                        value=f"Продавец: <@{seller_id}>\nЦена: {price} монет",
+                        inline=False
+                    )
+
+        await interaction.response.edit_message(embed=embed, view=self)
+
 
 async def add_to_market(interaction: Interaction, seller_id: int, card_name: str, price: int, card_cur: sqlite3.Cursor):
     """Добавить карточку на торговую площадку по имени."""
@@ -58,9 +96,16 @@ async def add_to_market(interaction: Interaction, seller_id: int, card_name: str
         await interaction.response.send_message("У вас нет такой карточки.", ephemeral=True)
         return
 
+    # Проверяем, есть ли уже эта карточка на рынке у этого продавца
+    market_cur.execute("SELECT * FROM marketplace WHERE seller_id = ? AND card_id = ?", (seller_id, card_id))
+    if market_cur.fetchone():
+        await interaction.response.send_message("Вы уже выставили эту карточку на продажу.", ephemeral=True)
+        return
+
     market_cur.execute("INSERT INTO marketplace (seller_id, card_id, price) VALUES (?, ?, ?)", (seller_id, card_id, price))
     market_db.commit()
     await interaction.response.send_message("Карточка успешно выставлена на продажу!", ephemeral=True)
+
 
 
 async def buy_card(interaction, buyer_id, listing_id, buyer_balance, card_cur, market_cur, market_db):
