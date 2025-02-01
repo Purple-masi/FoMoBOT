@@ -4,6 +4,22 @@ import random
 from ranking import add_rating_points  # Импортируем функцию работы с рейтингом
 from asyncio import sleep
 
+
+def init_hacker_db(db_cursor, db_connection):
+    """
+    Проверяет наличие необходимых столбцов в таблице users и, если их нет, добавляет их.
+    Колонка hack_success_chance хранит шанс успеха хакера (по умолчанию 0.1),
+    а stolen_money – количество украденных средств.
+    """
+    db_cursor.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in db_cursor.fetchall()]
+    if 'hack_success_chance' not in columns:
+        db_cursor.execute("ALTER TABLE users ADD COLUMN hack_success_chance REAL DEFAULT 0.1")
+    if 'stolen_money' not in columns:
+        db_cursor.execute("ALTER TABLE users ADD COLUMN stolen_money INTEGER DEFAULT 0")
+    db_connection.commit()
+
+
 class HackerGameView(View):
     def __init__(self, user, channel, db_cursor, db_connection, bot):
         super().__init__(timeout=None)
@@ -11,12 +27,12 @@ class HackerGameView(View):
         self.channel = channel
         self.db_cursor = db_cursor
         self.db_connection = db_connection
-        self.bot = bot  # Store the bot instance
+        self.bot = bot  # Экземпляр бота
         self.victim = None
         self.score = 0
         self.success_chance = 0.1
         self.game_active = False
-        self.remaining_time = 30  # Общее время на игру теперь 20 секунд
+        self.remaining_time = 30  # Время на игру
 
     async def select_victim(self):
         self.clear_items()
@@ -51,10 +67,11 @@ class HackerGameView(View):
         self.score = 0
         self.success_chance = 0.1
         await self.channel.send(
-            f"Игра началась! Цель: {self.victim['name']}. У вас есть {self.remaining_time} секунд, чтобы решить как можно больше примеров.")
+            f"Игра началась! Цель: {self.victim['name']}. У вас есть {self.remaining_time} секунд, чтобы решить как можно больше примеров."
+        )
 
-        # Start the game timer using the bot's event loop
-        self.bot_task = self.bot.loop.create_task(self.game_timer())  # Use self.bot here
+        # Запускаем таймер игры через цикл событий бота
+        self.bot_task = self.bot.loop.create_task(self.game_timer())
         await self.send_question()
 
     async def game_timer(self):
@@ -96,12 +113,14 @@ class HackerGameView(View):
             if user_answer == self.current_answer:
                 self.score += 1
                 self.success_chance += 0.05
-                await self.channel.send(f"Правильно! Шанс взлома увеличен на 5%. Текущий шанс: {self.success_chance:.0%}")
+                await self.channel.send(
+                    f"Правильно! Шанс взлома увеличен на 5%. Текущий шанс: {self.success_chance:.0%}")
             else:
                 self.success_chance -= 0.1
                 if self.success_chance < 0:
                     self.success_chance = 0
-                await self.channel.send(f"Неправильно! Шанс взлома уменьшен на 10%. Текущий шанс: {self.success_chance:.0%}")
+                await self.channel.send(
+                    f"Неправильно! Шанс взлома уменьшен на 10%. Текущий шанс: {self.success_chance:.0%}")
 
         except Exception as e:
             await self.channel.send(f"Произошла ошибка: {str(e)}")
@@ -129,23 +148,30 @@ class HackerGameView(View):
         success = random.random() < self.success_chance
         if success:
             stolen_money = random.randint(50, 200)
+            # Вычитаем деньги у жертвы и записываем их как украденные для хакера (то есть для игрока)
             self.db_cursor.execute("UPDATE users SET money = money - ? WHERE id = ?", (stolen_money, self.victim['id']))
+            self.db_cursor.execute("UPDATE users SET stolen_money = stolen_money + ? WHERE id = ?",
+                                   (stolen_money, self.user.id))
             self.db_cursor.execute("UPDATE users SET money = money + ? WHERE id = ?", (stolen_money, self.user.id))
+            self.db_cursor.execute("UPDATE users SET hack_success_chance = ? WHERE id = ?",(self.success_chance, self.user.id))
             self.db_cursor.execute("SELECT rating_point, rating_level FROM users WHERE id = ?", (self.user.id,))
             result = self.db_cursor.fetchone()
             if result:
                 current_points, current_level = result
                 new_points, new_level = add_rating_points(self.user.id, 20 + (current_level * 10), self.db_cursor,
                                                           self.db_connection)
-
                 while new_points >= 100 + (new_level * 20):
                     new_points -= 100 + (new_level * 20)  # Вычитаем очки до следующего уровня
                     new_level += 1  # Увеличиваем уровень
             self.db_connection.commit()
-            await self.channel.send(f"Взлом успешен! Вы украли {stolen_money} монет у {self.victim['name']}.")
+            await self.channel.send(
+                f"Взлом успешен! Вы похитили {stolen_money} монет у {self.victim['name']}.\n"
+                f"Сумма накопленных украденных средств: {stolen_money} монет (учтена в вашем профиле)."
+            )
         else:
             await self.channel.send("Взлом провален. Попробуйте снова позже.")
         await self.channel.delete()
+
 
 class VictimSelect(discord.ui.Select):
     def __init__(self, parent_view, options):
@@ -164,14 +190,17 @@ class VictimSelect(discord.ui.Select):
         await self.parent_view.channel.send(f"Вы выбрали цель: {victim_name}.")
         await self.parent_view.start_game()
 
-# Assuming this is in your main bot class or cog
+
+# Функция запуска работы профессии хакера
 async def start_hacker_job(user, guild, db_cursor, db_connection, bot):
+    # Инициализируем недостающие параметры в БД, если их ещё нет
+    init_hacker_db(db_cursor, db_connection)
+
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
         user: discord.PermissionOverwrite(read_messages=True, send_messages=True)
     }
     channel = await guild.create_text_channel(f"хакер {user.name}", overwrites=overwrites)
 
-    # Pass the bot instance when creating the view
     view = HackerGameView(user, channel, db_cursor, db_connection, bot)
     await view.select_victim()

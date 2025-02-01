@@ -1,13 +1,208 @@
-# card_system.py
 import sqlite3
 import discord
 from discord import app_commands, ui
 from discord import Interaction, Embed, File
+import random
+
+discon = sqlite3.connect("discord.db")
+discur = discon.cursor()
 
 # Подключение к базе данных
 cardcon = sqlite3.connect("cards.db")
 cardcur = cardcon.cursor()
 
+# Создание таблицы для кейсов, если она еще не существует
+cardcur.execute('''
+CREATE TABLE IF NOT EXISTS cases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    image_path TEXT,
+    contents TEXT -- Список карточек через запятую
+)
+''')
+cardcon.commit()
+
+class CaseView(ui.View):
+    def __init__(self, cases, user_id):
+        super().__init__()
+        self.cases = cases
+        self.current_index = 0
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: Interaction):
+        # Проверка, что взаимодействие исходит от инициатора
+        return interaction.user.id == self.user_id
+
+    @ui.button(label="⬅", style=discord.ButtonStyle.primary)
+    async def left_button(self, interaction: Interaction, button: ui.Button):
+        self.current_index = (self.current_index - 1) % len(self.cases)
+        await self.update_embed(interaction)
+
+    @ui.button(label="Открыть", style=discord.ButtonStyle.success)
+    async def open_button(self, interaction: Interaction, button: ui.Button):
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        case = self.cases[self.current_index]
+        await self.open_case(interaction, case)
+
+    @ui.button(label="➡", style=discord.ButtonStyle.primary)
+    async def right_button(self, interaction: Interaction, button: ui.Button):
+        self.current_index = (self.current_index + 1) % len(self.cases)
+        await self.update_embed(interaction)
+
+    async def update_embed(self, interaction: Interaction):
+        case = self.cases[self.current_index]
+        embed = Embed(
+            title=case["name"],
+            description=case["description"],
+            color=discord.Color.gold()
+        )
+        embed.set_image(url=f"attachment://{case['image_path']}")
+
+        try:
+            with open(f"casesPNG/{case['image_path']}", "rb") as img_file:
+                file = File(img_file, filename=case['image_path'])
+                await interaction.response.edit_message(
+                    embed=embed, attachments=[file], view=self
+                )
+        except FileNotFoundError:
+            await interaction.response.send_message(
+                "Ошибка: изображение кейса не найдено.", ephemeral=True
+            )
+
+    async def open_case(self, interaction: Interaction, case):
+        # Проверка, есть ли кейс у пользователя
+        cardcur.execute(
+            "SELECT 1 FROM player_cases WHERE player_id = ? AND case_id = ?",
+            (interaction.user.id, case["id"])
+        )
+        if not cardcur.fetchone():
+            await interaction.followup.send(
+                "У вас нет этого кейса. Пожалуйста, выберите другой кейс.", ephemeral=True
+            )
+            return
+
+        cards = case["contents"].split(", ")
+        random_card = random.choice(cards)
+
+        # Проверка наличия карты в базе данных
+        cardcur.execute("SELECT id, name FROM cards WHERE name = ?", (random_card,))
+        card = cardcur.fetchone()
+
+        if not card:
+            await interaction.followup.send(
+                f"Ошибка: карта '{random_card}' не найдена.", ephemeral=True
+            )
+            return
+
+        card_id, card_name = card
+        cardcur.execute(
+            "DELETE FROM player_cases WHERE player_id = ? AND case_id = ?",
+            (interaction.user.id, case["id"])
+        )
+        cardcon.commit()
+
+        # Проверка, есть ли карта у пользователя
+        cardcur.execute(
+            "SELECT 1 FROM player_cards WHERE player_id = ? AND card_id = ?",
+            (interaction.user.id, card_id)
+        )
+
+        if cardcur.fetchone():
+            await interaction.followup.send(
+                "Эта карта уже есть у вас. Выдаём вам 50 монет", ephemeral=True
+            )
+            discur.execute("SELECT money FROM users WHERE id = ?", (interaction.user.id,))
+            result = discur.fetchone()
+
+            if result is not None:
+                current_money = result[0]
+                # Увеличиваем количество монет на 50
+                new_money = current_money + 50
+                # Обновляем запись в базе данных
+                discur.execute("UPDATE users SET money = ? WHERE id = ?", (new_money, interaction.user.id))
+                discon.commit()
+            else:
+                # Если записи пользователя нет, создаем новую
+                discur.execute("INSERT INTO users (id, money) VALUES (?, ?)", (interaction.user.id, 50))
+                discon.commit()
+            cardcur.execute(
+                "DELETE FROM player_cases WHERE player_id = ? AND case_id = ?",
+                (interaction.user.id, case["id"])
+            )
+            cardcon.commit()
+
+        else:
+            await interaction.followup.send(
+                f"Вы открыли кейс и получили карту: {card_name}!", ephemeral=True
+            )
+            cardcur.execute(
+                "INSERT INTO player_cards (player_id, card_id) VALUES (?, ?)",
+                (interaction.user.id, card_id)
+            )
+            cardcon.commit()
+
+
+async def show_cases(interaction: Interaction):
+    """Команда для отображения кейсов пользователя."""
+    cardcur.execute(
+        """
+        SELECT cases.id, cases.name, cases.description, cases.image_path, cases.contents
+        FROM cases
+        JOIN player_cases ON cases.id = player_cases.case_id
+        WHERE player_cases.player_id = ?
+        """,
+        (interaction.user.id,)
+    )
+
+    cases = [
+        {"id": row[0], "name": row[1], "description": row[2], "image_path": row[3], "contents": row[4]} for row in cardcur.fetchall()
+    ]
+
+    if not cases:
+        await interaction.response.send_message(
+            "У вас нет доступных кейсов.", ephemeral=True
+        )
+        return
+
+    first_case = cases[0]
+
+    embed = Embed(
+        title=first_case["name"],
+        description=first_case["description"],
+        color=discord.Color.gold()
+    )
+    embed.set_image(url=f"attachment://{first_case['image_path']}")
+
+    view = CaseView(cases, interaction.user.id)
+
+    try:
+        with open(f"casesPNG/{first_case['image_path']}", "rb") as img_file:
+            file = File(img_file, filename=first_case['image_path'])
+            await interaction.response.send_message(
+                embed=embed,
+                file=file,
+                view=view, ephemeral=True
+            )
+    except FileNotFoundError:
+        await interaction.response.send_message(
+            "Ошибка: изображение первого кейса не найдено.", ephemeral=True
+        )
+
+
+async def add_case(interaction: Interaction, name: str, description: str, image_path: str, card_list: str):
+    """Добавление кейса в базу данных."""
+    try:
+        cardcur.execute(
+            "INSERT INTO cases (name, description, image_path, contents) VALUES (?, ?, ?, ?)",
+            (name, description, image_path, card_list)
+        )
+        cardcon.commit()
+        await interaction.response.send_message(f"Кейс '{name}' успешно добавлен!", ephemeral=True)
+    except sqlite3.IntegrityError:
+        await interaction.response.send_message(f"Кейс с именем '{name}' уже существует.", ephemeral=True)
 
 class CardSelect(ui.Select):
     def __init__(self, options):
@@ -182,6 +377,7 @@ import random
 import discord
 
 # Вероятности для каждой редкости (в процентах)
+# Вероятности для каждой редкости (в процентах)
 rarity_chances = {
     "Обычная": 0.7,  # 70% шанс на обычную карту
     "Редкая": 0.2,  # 20% шанс на необычную карту
@@ -189,9 +385,15 @@ rarity_chances = {
     "Легендарная": 0.03,  # 3% шанс на легендарную карту
 }
 
+# Шанс выпадения кейса
+case_drop_chance = 0.01  # 5% шанс на выпадение кейса
+
+def connect_to_database():
+    return sqlite3.connect("cards.db")
+
 async def try_drop_card(message: discord.Message, cardcur, cardcon):
-    # Вероятность выпадения карты при каждом сообщении (например, 10%)
-    drop_chance = 0.07  # Это можно настроить по вашему усмотрению
+    # Вероятность выпадения карты при каждом сообщении (например, 7%)
+    drop_chance = 0.01
 
     # Генерация случайного числа от 0 до 1
     if random.random() > drop_chance:
@@ -201,7 +403,7 @@ async def try_drop_card(message: discord.Message, cardcur, cardcon):
     random_roll = random.random()
 
     # Определение редкости карты на основе случайного числа
-    cumulative_chance = 0  # Это накопленная вероятность
+    cumulative_chance = 0
     selected_rarity = None
     for rarity, chance in rarity_chances.items():
         cumulative_chance += chance
@@ -210,7 +412,7 @@ async def try_drop_card(message: discord.Message, cardcur, cardcon):
             break
 
     if not selected_rarity:
-        return  # Если случайно ничего не выпало, выходим
+        return
 
     # Составляем запрос на случайную карту с нужной редкостью
     cardcur.execute("""
@@ -221,11 +423,10 @@ async def try_drop_card(message: discord.Message, cardcur, cardcon):
     available_cards = cardcur.fetchall()
 
     if not available_cards:
-        return  # Если карт нет с этой редкостью, выходим
+        return
 
     # Выбираем случайную карту из списка доступных
     card = random.choice(available_cards)
-
     name, description, tags, image_path, rarity = card
 
     # Проверяем, есть ли у пользователя уже эта карта
@@ -237,26 +438,23 @@ async def try_drop_card(message: discord.Message, cardcur, cardcon):
     """, (message.author.id, name))
 
     if cardcur.fetchone():
-        return  # Если карта уже есть у пользователя, не добавляем
-
-    # Получаем URL для изображения
-    image_url = f"attachment://{image_path}"
+        return
 
     # Создаем встраиваемое сообщение с карточкой
     embed = discord.Embed(
         title=name,
         description=description,
-        color=discord.Color.blue()  # Цвет можно настроить
+        color=discord.Color.gold()
     )
-    embed.add_field(name="Редкость", value=selected_rarity, inline=False)  # Редкость на русском
-    embed.add_field(name="Теги", value=tags, inline=False)  # Теги
-    embed.set_image(url=image_url)  # Изображение карточки
+    embed.add_field(name="Редкость", value=selected_rarity, inline=False)
+    embed.add_field(name="Теги", value=tags, inline=False)
+    embed.set_image(url=f"attachment://{image_path}")
 
-    # Выводим сообщение о выпадении карты
+    # Отправляем сообщение о выпадении карты
     await message.channel.send(
-        f"Поздравляем, {message.author.mention}! Вы получили новую карту:\n",  # Приветствие пользователю
+        f"Поздравляем, {message.author.mention}! Вы получили новую карту:",
         embed=embed,
-        file=discord.File(f"cardsPNG/{image_path}", filename=image_path)
+        file=discord.File(f"cardsPNG/{image_path}", filename=image_path), delete_after=5
     )
 
     # Получаем ID карты
@@ -268,8 +466,56 @@ async def try_drop_card(message: discord.Message, cardcur, cardcon):
     cardcon.commit()
 
     print(
-        f"Карточка '{name}' с редкостью '{selected_rarity}' и тегом '{tags}' была добавлена пользователю {message.author.name}.")
+        f"Карточка '{name}' с редкостью '{selected_rarity}' была добавлена пользователю {message.author.name}.")
+
+async def try_drop_case(message: discord.Message, cardcur, cardcon):
+    # Генерация случайного числа от 0 до 1 для проверки шанса выпадения кейса
+    if random.random() > case_drop_chance:
+        return
+
+    # Составляем запрос для получения случайного кейса
+    cardcur.execute("SELECT id, name, description, image_path FROM cases")
+    available_cases = cardcur.fetchall()
+
+    if not available_cases:
+        return
+
+    # Выбираем случайный кейс
+    case = random.choice(available_cases)
+    case_id, name, description, image_path = case
+
+    # Проверяем, есть ли у пользователя уже этот кейс
+    cardcur.execute("""
+        SELECT 1 FROM player_cases
+        WHERE player_id = ? AND case_id = ?
+    """, (message.author.id, case_id))
+
+    if cardcur.fetchone():
+        return
+
+    # Создаем встраиваемое сообщение о выпадении кейса
+    embed = discord.Embed(
+        title=f"Новый кейс: {name}",
+        description=description,
+        color=discord.Color.gold()
+    )
+    embed.set_image(url=f"attachment://{image_path}")
+
+    # Отправляем сообщение о выпадении кейса
+    await message.channel.send(
+        f"Удача на вашей стороне, {message.author.mention}! Вы получили новый кейс:",
+        embed=embed,
+        file=discord.File(f"casesPNG/{image_path}", filename=image_path), delete_after=5
+    )
+
+    # Добавляем кейс пользователю
+    cardcur.execute("INSERT INTO player_cases (player_id, case_id) VALUES (?, ?)", (message.author.id, case_id))
+    cardcon.commit()
+
+    print(f"Кейс '{name}' был добавлен пользователю {message.author.name}.")
+
 
 async def get_card_by_name(card_name, cardcur):
     cardcur.execute("SELECT * FROM cards WHERE name = ?", (card_name,))
     return cardcur.fetchone()
+
